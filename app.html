@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ball‑Wurf‑Spiel – kinderfreundlich</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f5fbff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #ui {
+      position: fixed; inset: 0 0 auto 0; display: flex; align-items: center; flex-wrap: wrap;
+      padding: 8px 12px; gap: 12px; background: linear-gradient(180deg, #ffffffcc, #ffffff66 65%, transparent);
+      -webkit-user-select: none; user-select: none;
+    }
+    #score { font-weight: 700; }
+    button {
+      appearance: none; border: none; border-radius: 14px; padding: 10px 14px; font-weight: 700;
+      background: #3fb6ff; color: white; box-shadow: 0 6px 0 #1c8fd1, 0 10px 20px #00000020; cursor: pointer; transition: transform 0.05s ease;
+    }
+    button:active { transform: translateY(2px); box-shadow: 0 4px 0 #1c8fd1, 0 8px 16px #00000020; }
+    #hint { margin-left: auto; opacity: .8; font-size: 14px; }
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="score">Treffer: <span id="hits">0</span> / <span id="total">0</span></div>
+    <button id="reset">Neu mischen</button>
+    <button id="slow">Langsam</button>
+    <button id="ctrl">Steuerung: Wisch</button>
+    <div id="hint">Ziehen &amp; Loslassen: zielen • <strong>Wischen</strong>: Kraft = Wischgeschwindigkeit</div>
+  </div>
+  <canvas id="game"></canvas>
+
+  <script>
+  (() => {
+    'use strict';
+
+    // --- DOM refs ---
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const hitsEl = document.getElementById('hits');
+    const totalEl = document.getElementById('total');
+    const resetBtn = document.getElementById('reset');
+    const slowBtn = document.getElementById('slow');
+    const ctrlBtn = document.getElementById('ctrl');
+    const hintEl = document.getElementById('hint');
+
+    // --- Utils ---
+    const rand = (min, max) => Math.random() * (max - min) + min;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const perfNow = () => performance.now();
+
+    // --- State & Collections ---
+    const gesture = { history: [], maxLen: 16 };
+    const state = { DPR: Math.min(2, window.devicePixelRatio || 1), w: 0, h: 0, last: 0, slowed: false, waveLock: 0 };
+    const balls = [];           // moving balls
+    const targets = [];         // balloons, stars, duck, water(ground)
+    const particles = [];       // confetti, drops, glows
+    let hits = 0;               // score
+    let totalTargets = 0;      // cumulative total for score display (right side)
+
+    // --- Gameplay constants ---
+    const GRAVITY = 1400; // px/s^2
+    const BALL_RADIUS = 16;
+    const MAX_SPEED = 1800; // px/s (raised per request)
+    const BASE_DIAG = 1000; // reference screen diagonal for power scaling
+    const DRAG = 0.002; // air drag
+
+    // --- Duck spacing rules ---
+    const MIN_DUCK_SEP = 90;           // min distance between ducks (px)
+    const MIN_LAUNCHER_DIST = 120;     // min distance duck <-> launcher (px)
+
+    function distance(ax, ay, bx, by){ const dx = ax - bx, dy = ay - by; return Math.hypot(dx, dy); }
+    function ducks(){ return targets.filter(t=>t.kind==='duck' && !t.__removed); }
+    function canPlaceDuckAt(x, y){
+      for(const d of ducks()){ if(distance(x,y,d.x,d.y) < MIN_DUCK_SEP) return false; }
+      if(distance(x,y,launcher.x,launcher.y) < MIN_LAUNCHER_DIST) return false;
+      return true;
+    }
+    function placeDuck(lanes, ys){
+      for(let tries=0; tries<24; tries++){
+        const x = lanes[Math.floor(rand(0, lanes.length))];
+        const y = ys[Math.floor(rand(0, ys.length))];
+        if(canPlaceDuckAt(x,y)){ const d = makeDuck(x,y); targets.push(d); return d; }
+      }
+      const x = lanes[Math.floor(rand(0, lanes.length))];
+      const y = ys[Math.floor(rand(0, ys.length))];
+      const dx = Math.sign(x - launcher.x) || 1; const nudgedX = clamp(x + dx*MIN_LAUNCHER_DIST, 40, state.w-40);
+      const d = makeDuck(nudgedX, y); targets.push(d); return d;
+    }
+
+    // --- Control mode (toggle button) ---
+    let controlMode = 'swipe'; // 'swipe' | 'click'
+    ctrlBtn.addEventListener('click', () => {
+      controlMode = controlMode === 'swipe' ? 'click' : 'swipe';
+      ctrlBtn.textContent = `Steuerung: ${controlMode === 'swipe' ? 'Wisch' : 'Klick'}`;
+      hintEl.textContent = controlMode === 'swipe'
+        ? 'Ziehen & Loslassen: zielen • Wischen: Kraft = Wischgeschwindigkeit'
+        : 'Tippe/Klicke auf eine Position: direkter Wurf ohne Ziehen';
+    });
+
+    // --- Launcher (vor Wasser; hinter Enten) ---
+    const launcher = { x: 0, y: 0 };
+    function updateLauncher(){
+      launcher.x = state.w * 0.5;
+      const waterObj = targets.find(t => t.kind === 'ground');
+      launcher.y = waterObj ? waterObj.surfaceY : (state.h - 60);
+    }
+
+    // --- Canvas Resize with DPR ---
+    function resize(){
+      state.w = canvas.clientWidth;
+      state.h = canvas.clientHeight;
+      canvas.width = Math.round(state.w * state.DPR);
+      canvas.height = Math.round(state.h * state.DPR);
+      ctx.setTransform(state.DPR, 0, 0, state.DPR, 0, 0);
+      updateLauncher();
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize();
+
+    // --- Targets ---
+    function makeBalloon(x, y, color){
+      return {
+        kind: 'balloon', x, y, r: 26, vy: 0, color, popped: false, hit: false,
+        draw(){
+          const {x, y, r} = this; ctx.save(); ctx.translate(x, y);
+          // string
+          ctx.strokeStyle = '#9a8a7a'; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(0, r); ctx.quadraticCurveTo(4, r+12, 0, r+28); ctx.stroke();
+          // balloon body
+          const grad = ctx.createRadialGradient(-r*0.3, -r*0.3, 4, 0, 0, r);
+          grad.addColorStop(0, 'white'); grad.addColorStop(1, this.color);
+          ctx.fillStyle = grad; ctx.strokeStyle = '#00000020';
+          ctx.beginPath(); ctx.ellipse(0,0, r*0.9, r, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+          // sparkles if hit
+          if(this.hit && !this.popped){ ctx.fillStyle = '#ffffffaa'; for(let i=0;i<3;i++){ ctx.beginPath(); ctx.arc(rand(-r, r), rand(-r, r), 2, 0, Math.PI*2); ctx.fill(); } }
+          ctx.restore();
+        },
+        step(dt){
+          if(this.popped){ this.vy += GRAVITY * 0.4 * dt; this.y += this.vy * dt; return; }
+          this.y += Math.sin(perfNow()*0.001 + x*0.01) * 18 * dt; // bobbing
+          if(this.hit){ this.vy = clamp(this.vy - 600*dt, -500, 0); this.y += this.vy * dt; }
+        },
+        onHit(){ if(this.popped) return; this.hit = true; setTimeout(() => { this.popped = true; makePopParticles(this.x, this.y, this.color); }, 250); }
+      }
+    }
+
+    function makeDuck(x, y){
+      const CLIMB_ACCEL = 280; // px/s^2 upward accel when hit
+      const MAX_CLIMB_SPEED = -520; // cap vy (negative up)
+      return {
+        kind: 'duck', x, y, w: 70, h: 45, wing: 0, vx: 0, vy: 0, hit: false,
+        draw(){
+          const {x, y, w, h} = this; ctx.save(); ctx.translate(x, y);
+          // body
+          ctx.fillStyle = '#ffd55c'; ctx.strokeStyle = '#00000020';
+          roundRect(-w/2, -h/2, w, h, 18, true, true);
+          // head
+          ctx.beginPath(); ctx.arc(-w*0.25, -h*0.6, h*0.35, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+          // eye
+          ctx.fillStyle = '#333'; ctx.beginPath(); ctx.arc(-w*0.31, -h*0.68, 3, 0, Math.PI*2); ctx.fill();
+          // beak
+          ctx.fillStyle = '#ff8a3d'; ctx.beginPath(); ctx.moveTo(-w*0.05, -h*0.6);
+          ctx.quadraticCurveTo(w*0.2, -h*0.5, w*0.12, -h*0.35);
+          ctx.quadraticCurveTo(w*0.05, -h*0.42, -w*0.02, -h*0.48); ctx.closePath(); ctx.fill();
+          // wing (flap when hit)
+          ctx.save(); ctx.rotate(Math.sin(this.wing)*0.9); ctx.fillStyle = '#ffdf88'; roundRect(-w*0.05, -h*0.15, w*0.3, h*0.3, 12, true, false); ctx.restore();
+          // ripple under duck
+          ctx.globalAlpha = 0.15; ctx.strokeStyle = '#5cc1ff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.ellipse(0, h*0.55, w*0.6, h*0.2, 0, 0, Math.PI*2); ctx.stroke(); ctx.globalAlpha = 1;
+          ctx.restore();
+        },
+        step(dt){
+          if(!this.hit){
+            // gentle swim near water surface
+            this.x += Math.sin(perfNow()*0.001 + this.y*0.01) * 18 * dt;
+          } else {
+            // fly upwards with accelerating climb
+            this.vy -= CLIMB_ACCEL * dt; if(this.vy < MAX_CLIMB_SPEED) this.vy = MAX_CLIMB_SPEED;
+            this.x += this.vx * dt; this.y += this.vy * dt; this.wing += dt*12;
+          }
+          if(this.x - this.w/2 > state.w + 40) this.x = -40; // wrap
+        },
+        onHit(){ this.hit = true; this.vx = 160; this.vy = -240; makeStarburst(this.x, this.y-30); }
+      }
+    }
+
+    function makeStar(x, y, color){
+      return {
+        kind: 'star', x, y, r: 28, rot: 0, spin: 0, color, hit: false, glow: 0,
+        draw(){
+          const {x,y,r} = this; ctx.save(); ctx.translate(x,y); ctx.rotate(this.rot);
+          drawStar(0,0,r,5,0.5,this.color); // base
+          if(this.hit){
+            ctx.globalAlpha = 0.9; drawStar(0,0,r*1.05,5,0.5,'#ffffff'); ctx.globalAlpha = 1; // bright overlay
+            const halo = ctx.createRadialGradient(0,0, r*0.6, 0,0, r*2); // halo
+            halo.addColorStop(0, 'rgba(255,255,180,0.8)'); halo.addColorStop(1, 'rgba(255,255,180,0.0)');
+            ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(0,0,r*2,0,Math.PI*2); ctx.fill(); ctx.globalCompositeOperation = 'source-over';
+          }
+          ctx.restore();
+        },
+        step(dt){ this.rot += (this.spin || 0) * dt; this.y += Math.sin(perfNow()*0.001 + this.x*0.01) * 22 * dt; if(this.hit){ this.glow = Math.min(1, this.glow + dt*2); } },
+        onHit(){ this.hit = true; this.spin = 6; makeConfetti(this.x, this.y); }
+      }
+    }
+
+    function makeGround(){
+      // Water area. Keep kind 'ground' to satisfy tests.
+      const surfaceY = state.h - Math.max(80, state.h * 0.18); // water surface (made higher earlier)
+      const height = state.h - surfaceY; const midY = surfaceY + height * 0.5; // imaginary mid-line
+      return {
+        kind: 'ground', x: state.w/2, y: surfaceY, w: state.w, h: height, surfaceY, midY,
+        draw(){
+          const {y, h} = this; ctx.save();
+          const grad = ctx.createLinearGradient(0, y, 0, y + h);
+          grad.addColorStop(0, '#bde8ff'); grad.addColorStop(1, '#7ad1ff');
+          ctx.fillStyle = grad; ctx.fillRect(0, y, state.w, h);
+          // waves at surface
+          ctx.strokeStyle = '#5cc1ff'; ctx.globalAlpha = 0.6; ctx.lineWidth = 2;
+          for(let i=0;i<state.w;i+=20){ ctx.beginPath(); ctx.moveTo(i, y + 2 + Math.sin((i+y)*0.02 + perfNow()*0.003)*2); ctx.quadraticCurveTo(i+10, y + 4, i+20, y + 2 + Math.sin((i+y+20)*0.02 + perfNow()*0.003)*2); ctx.stroke(); }
+          ctx.globalAlpha = 1; ctx.restore();
+        }, step(){}, onHit(){}
+      }
+    }
+
+    // --- Particles ---
+    function makePopParticles(x,y,color){ for(let i=0;i<24;i++){ particles.push({ x, y, vx: Math.cos(i/24*2*Math.PI)*rand(100,240), vy: Math.sin(i/24*2*Math.PI)*rand(100,240), life: rand(0.6,1.1), r: rand(2,5), color, kind: 'pop' }); } }
+    function makeConfetti(x,y){ for(let i=0;i<30;i++){ particles.push({ x, y, vx: rand(-240,240), vy: rand(-100, -300), life: rand(0.8,1.3), r: rand(2,4), color: `hsl(${Math.floor(rand(0,360))} 90% 60%)`, kind: 'confetti' }); } }
+    function makeStarburst(x,y){ for(let i=0;i<16;i++){ particles.push({ x, y, vx: Math.cos(i/16*2*Math.PI)*rand(120,220), vy: Math.sin(i/16*2*Math.PI)*rand(120,220), life: rand(0.5,0.9), r: rand(2,3), color: '#fff', kind: 'glow' }); } }
+    function makeWaterSplash(x, y){ const drops = 18; for(let i=0;i<drops;i++){ const ang = (i/drops)*Math.PI - Math.PI/2; const speed = rand(180, 360); particles.push({ x, y, vx: Math.cos(ang)*speed, vy: Math.sin(ang)*speed, life: rand(0.5,0.9), r: rand(1.5,3), color: '#78c9ff', kind: 'drop' }); } }
+
+    // --- Power mapping ---
+    const powerScale = (diag) => (diag || Math.hypot(state.w, state.h)) / BASE_DIAG;
+    const mapSwipeToSpeed = (vmagPxMs, diag) => clamp(vmagPxMs * 1000 * 0.9 * powerScale(diag), 220, MAX_SPEED);
+    const mapDistanceToSpeed = (distPx, diag) => clamp(distPx * 3.2 * powerScale(diag), 180, MAX_SPEED);
+
+    // --- Swipe velocity estimator ---
+    const SWIPE_WINDOW_MS = 140; // look-back window
+    function swipeVelocityFromHistory(hist){
+      if(!hist || hist.length < 2) return { vx:0, vy:0, vmag:0 };
+      const last = hist[hist.length - 1];
+      // choose the earliest sample within window
+      let idx = hist.length - 2;
+      while(idx > 0 && (last.t - hist[idx].t) < SWIPE_WINDOW_MS) idx--;
+      const a = hist[Math.max(0, idx)];
+      const dtms = Math.max(1, last.t - a.t);
+      const vx = (last.x - a.x) / dtms;
+      const vy = (last.y - a.y) / dtms;
+      // also consider max segment speed in the window to capture quick flicks
+      let peak = 0; let pvx = vx, pvy = vy;
+      for(let i = hist.length - 1; i > 0 && (last.t - hist[i-1].t) <= SWIPE_WINDOW_MS; i--){
+        const b = hist[i], a2 = hist[i-1]; const dt = Math.max(1, b.t - a2.t);
+        const svx = (b.x - a2.x) / dt; const svy = (b.y - a2.y) / dt; const s = Math.hypot(svx, svy);
+        if(s > peak){ peak = s; pvx = svx; pvy = svy; }
+      }
+      // blend average and peak for stability
+      const vxMix = vx*0.7 + pvx*0.3; const vyMix = vy*0.7 + pvy*0.3; const vmagMix = Math.hypot(vxMix, vyMix);
+      return { vx: vxMix, vy: vyMix, vmag: vmagMix };
+    }
+
+    // --- Input / Throwing ---
+    let aiming = false; let aimX = 0, aimY = 0;
+    const pointerPos = (e) => { const rect = canvas.getBoundingClientRect(); const x = (e.clientX ?? (e.touches && e.touches[0]?.clientX) ?? 0) - rect.left; const y = (e.clientY ?? (e.touches && e.touches[0]?.clientY) ?? 0) - rect.top; return { x, y }; };
+    function throwBall(toX, toY, opts={}){
+      const baseX = launcher.x, baseY = launcher.y; const dx = toX - baseX; const dy = toY - baseY; let speed, ang;
+      if(opts.velocity){ const vx = opts.velocity.vx, vy = opts.velocity.vy; ang = Math.atan2(vy, vx); const vmag = Math.hypot(vx, vy); speed = mapSwipeToSpeed(vmag, Math.hypot(state.w, state.h)); }
+      else { ang = Math.atan2(dy, dx); const dist = Math.hypot(dx, dy); speed = mapDistanceToSpeed(dist, Math.hypot(state.w, state.h)); }
+      const vx0 = Math.cos(ang) * speed; const vy0 = Math.sin(ang) * speed; balls.push({ x: baseX, y: baseY, vx: vx0, vy: vy0, r: BALL_RADIUS, alive: true }); }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      const p = pointerPos(e);
+      if(controlMode === 'swipe'){
+        aiming = true; aimX = p.x; aimY = p.y; gesture.history.length = 0; gesture.history.push({t: perfNow(), x: p.x, y: p.y});
+      } else {
+        // click mode: show aim line to the tap position until release
+        aiming = true; aimX = p.x; aimY = p.y; gesture.history.length = 0;
+      }
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      const p = pointerPos(e);
+      if(controlMode === 'swipe'){
+        if(aiming){ aimX = p.x; aimY = p.y; }
+        gesture.history.push({ t: perfNow(), x: p.x, y: p.y });
+        if(gesture.history.length > gesture.maxLen) gesture.history.shift();
+      } else {
+        // click mode: update preview line only, no history
+        if(aiming){ aimX = p.x; aimY = p.y; }
+      }
+    });
+    function endAim(e){
+      const p = pointerPos(e);
+      if(controlMode === 'click'){
+        aiming = false; // hide preview line
+        throwBall(p.x, p.y); // direct throw, ignore velocity
+        return;
+      }
+      // Swipe mode → estimate velocity from the recent gesture window
+      const { vx, vy, vmag } = swipeVelocityFromHistory(gesture.history);
+      aiming = false;
+      const useSwipe = vmag > 0.25; // px/ms threshold
+      if(useSwipe){ throwBall(p.x, p.y, { velocity: { vx, vy } }); } else { throwBall(p.x, p.y); }
+      gesture.history.length = 0;
+    }
+    canvas.addEventListener('pointerup', endAim);
+    canvas.addEventListener('pointercancel', (e)=>{ if(controlMode==='swipe') endAim(e); else aiming=false; });
+    // IMPORTANT: no separate 'click' handler → prevents duplicate throws
+
+    resetBtn.addEventListener('click', () => setupLevel());
+    slowBtn.addEventListener('click', () => { state.slowed = !state.slowed; slowBtn.textContent = state.slowed ? 'Normal' : 'Langsam'; });
+
+    // --- Physics & Update ---
+    function step(dt){
+      // update wave lock timer
+      if(state.waveLock > 0) state.waveLock = Math.max(0, state.waveLock - dt);
+
+      // Balls
+      for(const b of balls){ if(!b.alive) continue; b.vx *= (1 - DRAG * dt*60); b.vy += GRAVITY * dt; b.x += b.vx * dt; b.y += b.vy * dt;
+        // collide with water: allow entry at surface, splash at mid-line
+        const waterObj = targets.find(t=>t.kind==='ground');
+        if(waterObj){ const surfaceY = waterObj.surfaceY; const midY = waterObj.midY;
+          if(!b.inWater && b.y + b.r > surfaceY){ b.inWater = true; }
+          if(b.inWater){ b.vx *= 0.985; b.vy *= 0.985; if(b.y + b.r > midY){ b.y = midY - b.r; makeWaterSplash(b.x, midY - 2); b.alive = false; } }
+        } else { const groundY = state.h - 34; if(b.y + b.r > groundY){ b.y = groundY - b.r; makeWaterSplash(b.x, groundY - 2); b.alive = false; } }
+        // walls
+        if(b.x - b.r < 0){ b.x = b.r; b.vx *= -0.6; } if(b.x + b.r > state.w){ b.x = state.w - b.r; b.vx *= -0.6; }
+        // off-screen
+        if(b.y - b.r > state.h + 200) b.alive = false;
+      }
+
+      // Targets
+      for(const t of targets){ if(t.step) t.step(dt); }
+
+      // Collisions (ball vs target)
+      for(const b of balls){ if(!b.alive) continue; for(const t of targets){ if(t.kind==='ground' || t.__done) continue;
+          if(t.kind==='balloon' || t.kind==='star'){
+            const r = t.r + b.r; const dx = b.x - t.x; const dy = b.y - t.y; if(dx*dx + dy*dy <= r*r){ t.__done = true; if(t.onHit) t.onHit(); hits++; hitsEl.textContent = String(hits); const ang = Math.atan2(dy, dx); b.vx = Math.cos(ang)*-220; b.vy = Math.sin(ang)*-220; }
+          } else if(t.kind==='duck'){
+            const left = t.x - t.w/2 - b.r, right = t.x + t.w/2 + b.r; const top = t.y - t.h/2 - b.r, bottom = t.y + t.h/2 + b.r;
+            if(b.x>left && b.x<right && b.y>top && b.y<bottom){ if(!t.__done){ t.__done = true; if(t.onHit) t.onHit(); hits++; hitsEl.textContent = String(hits); } b.vy = -300; b.vx += (b.x < t.x ? -1 : 1) * -120; }
+          }
+        } }
+
+      // Particles
+      for(const p of particles){ p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; if(p.kind==='confetti'){ p.vy += GRAVITY*0.7 * dt; } else if(p.kind==='drop'){ p.vy += GRAVITY*1.2 * dt; p.vx *= 0.99; } }
+      // cleanup
+      for(let i=balls.length-1;i>=0;i--){ if(!balls[i].alive) balls.splice(i,1); }
+      for(let i=particles.length-1;i>=0;i--){ if(particles[i].life<=0) particles.splice(i,1); }
+
+      // Win / Waves
+      const remaining = targets.filter(t=> t.kind!=='ground' && !t.__done).length;
+      if(remaining===0 && particles.length===0){
+        makeConfetti(state.w*0.5, state.h*0.35);
+        setupLevel();
+      } else {
+        // if only ducks remain, spawn a new random wave (balloons, stars, ducks)
+        const nonDucks = targets.filter(t => t.kind!=='ground' && t.kind!=='duck' && !t.__done);
+        const ducksRemain = targets.filter(t => t.kind==='duck' && !t.__done).length;
+        if(nonDucks.length===0 && ducksRemain>0 && state.waveLock===0){
+          spawnWave();
+          state.waveLock = 0.8; // avoid re-spawning every frame
+        }
+      }
+    }
+
+    function spawnWave(){
+      const lanes = [state.w*0.35, state.w*0.5, state.w*0.65, state.w*0.8];
+      const water = targets.find(t=>t.kind==='ground');
+      const surf = water ? water.surfaceY : state.h*0.8;
+      const ys = [surf + 8, surf + 14, surf + 20];
+      const colors = ['#ff6b91','#7ee081','#ffd85e','#7ab7ff','#c39bff'];
+      // Exactly ONE duck per new wave, plus random balloons/stars (ensure at least one non-duck)
+      let duckCount = 1;
+      let balloonCount = Math.round(Math.random());
+      let starCount = Math.round(Math.random());
+      if(balloonCount + starCount === 0) starCount = 1; // guarantee at least one non-duck to avoid instant re-trigger
+
+      let added = 0;
+      for(let i=0;i<balloonCount;i++){ targets.push(makeBalloon(rand(state.w*0.45, state.w*0.85), rand(state.h*0.25, state.h*0.5), colors[Math.floor(rand(0,colors.length))])); added++; }
+      for(let i=0;i<starCount;i++){ targets.push(makeStar(lanes[Math.floor(rand(0, lanes.length))], rand(state.h*0.25, state.h*0.5), colors[Math.floor(rand(0,colors.length))])); added++; }
+      for(let i=0;i<duckCount;i++){ placeDuck(lanes, ys); added++; }
+
+      // Increase cumulative total (right side of score)
+      totalTargets += added;
+      totalEl.textContent = String(totalTargets);
+    }
+
+    // --- Rendering (Z-order: water < launcher < other targets < balls < particles) ---
+    function render(){
+      // background
+      const g = ctx.createLinearGradient(0,0,0,state.h); g.addColorStop(0,'#e8f7ff'); g.addColorStop(1,'#f7fcff'); ctx.fillStyle = g; ctx.fillRect(0,0,state.w,state.h);
+      ctx.globalAlpha = 0.7; ctx.fillStyle = '#ffffff'; const t = perfNow()*0.0001; for(let i=0;i<5;i++){ const y = 60 + i*40 + Math.sin(t*3+i)*10; const x = (t*120 + i*200) % (state.w+200) - 100; blob(x, y, 60); } ctx.globalAlpha = 1;
+
+      // wobble for launcher (visual only)
+      const tt = perfNow(); const wobbleY = Math.sin(tt * 0.003) * 3; const wobbleRot = Math.sin(tt * 0.0025) * 0.07;
+
+      // water first (back)
+      for(const tgt of targets){ if(tgt.kind==='ground' && tgt.draw) tgt.draw(); }
+
+      // launcher (front of water, behind ducks)
+      ctx.save(); ctx.translate(launcher.x, launcher.y + wobbleY); ctx.rotate(wobbleRot);
+      // shadow
+      ctx.fillStyle = '#00000010'; ctx.beginPath(); ctx.ellipse(0, 14, 38, 10, 0, 0, Math.PI*2); ctx.fill();
+      // body
+      ctx.fillStyle = '#74c7ff'; roundRect(-26, -10, 52, 20, 10, true, false); ctx.fillStyle = '#88d5ff'; roundRect(-12, -18, 24, 10, 5, true, false);
+      ctx.restore();
+
+      // other targets (ducks, balloons, stars) with duck depth ordering
+      const nonGround = targets.filter(t=>t.kind!=='ground');
+      const nonDucks = nonGround.filter(t=>t.kind!=='duck');
+      const duckList = nonGround.filter(t=>t.kind==='duck').sort((a,b)=> a.y - b.y); // ascending y → lower ducks are drawn last (in front)
+      for(const tgt of nonDucks){ if(tgt.draw) tgt.draw(); }
+      for(const tgt of duckList){ if(tgt.draw) tgt.draw(); }
+
+      // balls
+      for(const b of balls){ ctx.save(); ctx.translate(b.x, b.y); const grad = ctx.createRadialGradient(-6,-6,2, 0,0, BALL_RADIUS); grad.addColorStop(0,'#fff'); grad.addColorStop(1,'#60a7ff'); ctx.fillStyle = grad; ctx.strokeStyle = '#00000020'; ctx.beginPath(); ctx.arc(0,0, BALL_RADIUS, 0, Math.PI*2); ctx.fill(); ctx.stroke(); ctx.restore(); }
+
+      // particles
+      for(const p of particles){ ctx.globalAlpha = Math.max(0, p.life); if(p.kind==='glow' || p.kind==='drop'){ ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); } else { ctx.fillStyle = p.color; ctx.save(); ctx.translate(p.x,p.y); ctx.rotate((1-p.life)*6); ctx.fillRect(-p.r/2,-p.r/2,p.r,p.r); ctx.restore(); } ctx.globalAlpha = 1; }
+
+      // aiming helper only in CLICK mode (no dashed line in swipe mode)
+      if(aiming && controlMode === 'click'){
+        ctx.setLineDash([8,8]); ctx.lineWidth = 2; ctx.strokeStyle = '#2b8fffaa';
+        ctx.beginPath(); ctx.moveTo(launcher.x, launcher.y); ctx.lineTo(aimX, aimY); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // --- Drawing helpers ---
+    function drawStar(x, y, r, points, inset, color){ ctx.beginPath(); ctx.moveTo(x, y - r); for (let i = 0; i < points; i++){ const a = (i * 2 * Math.PI) / points; ctx.lineTo(x + Math.sin(a) * r, y - Math.cos(a) * r); ctx.lineTo(x + Math.sin(a + Math.PI / points) * r * inset, y - Math.cos(a + Math.PI / points) * r * inset); } ctx.closePath(); ctx.fillStyle = color; ctx.fill(); ctx.strokeStyle = '#00000015'; ctx.stroke(); }
+    function roundRect(x, y, w, h, r, fill, stroke){ const rr = Math.min(r, Math.abs(w)/2, Math.abs(h)/2); ctx.beginPath(); ctx.moveTo(x + rr, y); ctx.arcTo(x + w, y, x + w, y + h, rr); ctx.arcTo(x + w, y + h, x, y + h, rr); ctx.arcTo(x, y + h, x, y, rr); ctx.arcTo(x, y, x + w, y, rr); ctx.closePath(); if(fill) ctx.fill(); if(stroke) ctx.stroke(); }
+    function blob(cx, cy, r){ ctx.beginPath(); ctx.arc(cx, cy, r*0.6, 0, Math.PI*2); ctx.arc(cx + r*0.6, cy + r*0.05, r*0.55, 0, Math.PI*2); ctx.arc(cx - r*0.4, cy + r*0.15, r*0.45, 0, Math.PI*2); ctx.fill(); }
+
+    // --- Level setup ---
+    function setupLevel(){
+      balls.length = 0; targets.length = 0; particles.length = 0; hits = 0;
+      const lanes = [state.w*0.35, state.w*0.5, state.w*0.65, state.w*0.8];
+      const water = makeGround(); targets.push(water); const surf = water.surfaceY; updateLauncher();
+      const ys = [surf + 8, surf + 14, surf + 20];
+      const colors = ['#ff6b91','#7ee081','#ffd85e','#7ab7ff','#c39bff'];
+      const balloonCount = 1 + Math.round(Math.random());
+      for(let i=0;i<balloonCount;i++){ targets.push(makeBalloon(rand(state.w*0.45, state.w*0.85), rand(state.h*0.25, state.h*0.5), colors[Math.floor(rand(0,colors.length))])); }
+      placeDuck(lanes, ys);
+      const starCount = 1 + Math.round(Math.random());
+      for(let i=0;i<starCount;i++){ targets.push(makeStar(lanes[Math.floor(rand(0, lanes.length))], rand(state.h*0.25, state.h*0.5), colors[Math.floor(rand(0,colors.length))])); }
+      totalTargets = targets.filter(t=>t.kind!=='ground').length;
+      totalEl.textContent = String(totalTargets);
+      hitsEl.textContent = '0';
+    }
+
+    // --- Tiny Test Harness (console) ---
+    function runTests(){
+      const results = []; const assert = (name, cond) => { results.push({ name, pass: !!cond }); };
+
+      // clamp tests
+      assert('clamp within', clamp(5, 0, 10) === 5);
+      assert('clamp low', clamp(-2, 0, 10) === 0);
+      assert('clamp high', clamp(42, 0, 10) === 10);
+
+      // launcher initialized & canvas sized
+      assert('launcher initialized X', Number.isFinite(launcher.x));
+      assert('launcher initialized Y', Number.isFinite(launcher.y));
+      assert('canvas width > 0', canvas.width > 0);
+      assert('canvas height > 0', canvas.height > 0);
+
+      // throwBall distance/swipe/cap
+      const before = balls.length; throwBall(launcher.x + 100, launcher.y - 100); assert('throwBall distance-power adds ball', balls.length === before + 1); balls.length = before;
+      throwBall(launcher.x + 100, launcher.y - 100, { velocity: { vx: 0.5, vy: -0.2 } }); assert('throwBall swipe-power adds ball', balls.length === before + 1); const tb = balls[balls.length-1]; assert('throwBall speed finite', Number.isFinite(tb.vx) && Number.isFinite(tb.vy)); balls.length = before;
+      throwBall(launcher.x + 100, launcher.y - 100, { velocity: { vx: 10, vy: -10 } }); const tb2 = balls[balls.length-1]; assert('speed <= MAX_SPEED', Math.hypot(tb2.vx, tb2.vy) <= MAX_SPEED + 1e-6); balls.length = before;
+
+      // level build
+      setupLevel(); const nonGround = targets.filter(t=>t.kind !== 'ground').length; const groundCount = targets.filter(t=>t.kind === 'ground').length; assert('setupLevel non-ground >= 1', nonGround >= 1); assert('setupLevel has ground', groundCount >= 1);
+
+      // collision increases hits
+      const startHits = hits; const star = makeStar(300, 300, '#fff'); targets.push(star); balls.push({ x: 300, y: 300, vx: 0, vy: 0, r: BALL_RADIUS, alive: true }); step(0.016); assert('collision increments hits', hits === startHits + 1);
+
+      // power scaling with screen
+      const smallDiag = 700, largeDiag = 1600; const sDistSmall = mapDistanceToSpeed(180, smallDiag); const sDistLarge = mapDistanceToSpeed(180, largeDiag); assert('power scales with screen size (distance)', sDistLarge > sDistSmall);
+      const sSwipeSmall = mapSwipeToSpeed(0.6, smallDiag); const sSwipeLarge = mapSwipeToSpeed(0.6, largeDiag); assert('power scales with screen size (swipe)', sSwipeLarge > sSwipeSmall);
+
+      // requested behaviors
+      const water = targets.find(t=>t.kind==='ground'); if(water){ assert('launcher y at water surface', Math.abs(launcher.y - water.surfaceY) < 1.01); }
+      { const b = makeBalloon(200, 200, '#f0f'); b.popped = true; b.vy = 0; const y0 = b.y; b.step(0.05); assert('balloon falls after pop', b.y > y0); }
+      { const s = makeStar(300, 200, '#fc0'); s.onHit(); assert('star hit flag set', s.hit === true); }
+      { const pc0 = particles.length; const w = makeGround(); const midY = w.midY, surfaceY = w.surfaceY; targets.push(w); balls.push({ x: state.w*0.5, y: surfaceY - 10, vx: 0, vy: 300, r: BALL_RADIUS, alive: true }); for(let i=0;i<20;i++) step(0.016); const noSurfaceSplash = particles.length === pc0; const pc1 = particles.length; balls.push({ x: state.w*0.5, y: midY - 20, vx: 0, vy: 400, r: BALL_RADIUS, alive: true, inWater: true }); for(let i=0;i<30;i++) step(0.016); const didMidSplash = particles.length > pc1 && particles.some(p=>p.kind==='drop'); assert('no splash at surface', noSurfaceSplash); assert('splash at mid-line', didMidSplash); }
+      { let d = targets.find(t=>t.kind==='duck'); if(!d){ d = makeDuck(state.w*0.5, state.h*0.8); targets.push(d); } assert('duck starts low (y > 70% h)', d.y > state.h*0.7); const y0 = d.y; d.onHit(); step(0.05); assert('duck rises after hit', d.y < y0); }
+      { const d = makeDuck(state.w*0.5, state.h*0.8); d.onHit(); const vy0 = d.vy; d.step(0.1); assert('duck climbs faster (vy more negative)', d.vy < vy0); }
+      { const diag = 1000; const lowDist = mapDistanceToSpeed(40, diag); assert('lower min distance power (<300)', lowDist < 300); }
+      // NEW: swipe velocity estimator should reflect faster swipes
+      {
+        const now = perfNow();
+        const slow = [ {t:now-200,x:0,y:0}, {t:now-50,x:40,y:0}, {t:now,x:60,y:0} ];
+        const fast = [ {t:now-120,x:0,y:0}, {t:now-20,x:180,y:0}, {t:now,x:220,y:0} ];
+        const vs = swipeVelocityFromHistory(slow).vmag;
+        const vf = swipeVelocityFromHistory(fast).vmag;
+        assert('fast swipe > slow swipe', vf > vs);
+      }
+      // NEW: click mode single throw sanity
+      { const prev = controlMode; controlMode = 'click'; const b0 = balls.length; throwBall(launcher.x+50, launcher.y-20); assert('click mode single manual throw', balls.length === b0+1); balls.pop(); controlMode = prev; }
+      // NEW: wave spawns when only ducks remain
+      {
+        targets.length = 0; const water = makeGround(); targets.push(water); targets.push(makeDuck(state.w*0.5, water.surfaceY + 12));
+        const beforeCount = targets.filter(t=>t.kind!=='ground' && !t.__done).length;
+        step(0.2);
+        const afterCount = targets.filter(t=>t.kind!=='ground' && !t.__done).length;
+        const spawned = afterCount > beforeCount;
+        assert('wave spawned on only-ducks', spawned);
+      }
+      // NEW: duck spacing from launcher & each other on placement
+      {
+        setupLevel();
+        const ds = targets.filter(t=>t.kind==='duck');
+        let ok = true;
+        for(let i=0;i<ds.length;i++){
+          if(distance(ds[i].x, ds[i].y, launcher.x, launcher.y) < MIN_LAUNCHER_DIST) ok = false;
+          for(let j=i+1;j<ds.length;j++) if(distance(ds[i].x, ds[i].y, ds[j].x, ds[j].y) < MIN_DUCK_SEP) ok = false;
+        }
+        assert('duck spacing satisfied', ok);
+      }
+
+      // NEW: wave spawns exactly one duck and increases total score target
+      {
+        targets.length = 0; particles.length = 0; balls.length = 0; hits = 0; totalTargets = 0;
+        const water = makeGround(); targets.push(water); updateLauncher();
+        // only one duck on field
+        const d0 = makeDuck(state.w*0.5, water.surfaceY + 12); targets.push(d0);
+        totalTargets = 1; totalEl.textContent = String(totalTargets);
+        const ducksBefore = targets.filter(t=>t.kind==='duck' && !t.__done).length;
+        const totalBefore = totalTargets;
+        // trigger wave
+        state.waveLock = 0; step(0.2);
+        const ducksAfter = targets.filter(t=>t.kind==='duck' && !t.__done).length;
+        const nonDucksAfter = targets.filter(t=>t.kind!=='ground' && t.kind!=='duck' && !t.__done).length;
+        const totalAfter = totalTargets;
+        assert('wave adds exactly one duck', ducksAfter === ducksBefore + 1);
+        assert('wave adds at least one non-duck', nonDucksAfter >= 1);
+        assert('total increases after wave', totalAfter > totalBefore);
+      }
+
+      const passCount = results.filter(r=>r.pass).length; console.log(`Test Results: ${passCount}/${results.length} passed`, results);
+    }
+
+    // --- Main Loop ---
+    function loop(ts){ if(!state.last) state.last = ts; const rawDt = (ts - state.last) / 1000; state.last = ts; const dt = clamp(rawDt, 0, 0.033) * (state.slowed ? 0.5 : 1); step(dt); render(); requestAnimationFrame(loop); }
+
+    // Start
+    setupLevel();
+    runTests(); // console-only tests
+    requestAnimationFrame(loop);
+
+  })();
+  </script>
+</body>
+</html>
