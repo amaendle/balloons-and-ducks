@@ -137,7 +137,7 @@ export class SoundEngine {
 
     this.__sounds = {
       // 1) Comic duck quack (noise bandpass + square pitch sweep)
-      duck: () => {
+      duckold: () => {
         const t = this.ctx.currentTime;
 
         // noisy "rasp"
@@ -169,6 +169,92 @@ export class SoundEngine {
 
         o.start(t);
         o.stop(t + d2);
+      },
+
+      duck: () => {
+        const t0 = this.ctx.currentTime;
+        const durMul = this.params.duck?.dur ?? 1;
+        const gainMul = this.params.duck?.gain ?? 1;
+      
+        // Tighter, snappier double-quack
+        const hits = [
+          { t: t0 + 0.00 * durMul, amp: 1.0 },
+          { t: t0 + 0.14 * durMul, amp: 0.88 },
+        ];
+      
+        for (const h of hits) {
+          const t = h.t;
+      
+          // --- voiced quack (more Donald: higher + slightly vibrato) ---
+          const o = this.ctx.createOscillator();
+          o.type = "square";
+          o.frequency.setValueAtTime(720, t);
+          o.frequency.exponentialRampToValueAtTime(360, t + 0.10 * durMul);
+      
+          // Nasal formant bandpass
+          const bp = this.ctx.createBiquadFilter();
+          bp.type = "bandpass";
+          this._setQ(bp, 7.5);
+      
+          // Wah sweep (higher + quicker)
+          bp.frequency.setValueAtTime(1900, t);
+          bp.frequency.exponentialRampToValueAtTime(850, t + 0.11 * durMul);
+      
+          // Wah-wah wobble on the filter frequency
+          const lfo = this.ctx.createOscillator();
+          lfo.type = "sine";
+          lfo.frequency.setValueAtTime(12, t); // faster wobble
+          const lfoGain = this.ctx.createGain();
+          lfoGain.gain.setValueAtTime(320, t); // deeper wobble (Hz)
+          lfo.connect(lfoGain).connect(bp.frequency);
+      
+          // Tiny pitch vibrato (helps “cartoon voice”)
+          const vib = this.ctx.createOscillator();
+          vib.type = "sine";
+          vib.frequency.setValueAtTime(18, t);
+          const vibGain = this.ctx.createGain();
+          vibGain.gain.setValueAtTime(14, t); // in Hz
+          vib.connect(vibGain).connect(o.frequency);
+      
+          // Envelope: short, punchy
+          const g = this.ctx.createGain();
+          g.gain.setValueAtTime(1e-4, t);
+          g.gain.exponentialRampToValueAtTime(0.62 * h.amp * gainMul, t + 0.008);
+          g.gain.exponentialRampToValueAtTime(1e-4, t + 0.16 * durMul);
+      
+          o.connect(bp).connect(g);
+          g.connect(this.master);
+          g.connect(this.fxSend);
+      
+          // --- raspy air layer (a bit brighter) ---
+          const n = this.ctx.createBufferSource();
+          n.buffer = this._noiseBuffer(0.11);
+      
+          const nbp = this.ctx.createBiquadFilter();
+          nbp.type = "bandpass";
+          this._setQ(nbp, 2.2);
+          nbp.frequency.setValueAtTime(1500, t);
+          nbp.frequency.exponentialRampToValueAtTime(950, t + 0.08 * durMul);
+      
+          const ng = this.ctx.createGain();
+          ng.gain.setValueAtTime(1e-4, t);
+          ng.gain.exponentialRampToValueAtTime(0.22 * h.amp * gainMul, t + 0.006);
+          ng.gain.exponentialRampToValueAtTime(1e-4, t + 0.10 * durMul);
+      
+          n.connect(nbp).connect(ng);
+          ng.connect(this.master);
+          ng.connect(this.fxSend);
+      
+          // start/stop
+          o.start(t);
+          o.stop(t + 0.20 * durMul);
+      
+          lfo.start(t);  lfo.stop(t + 0.20 * durMul);
+          vib.start(t);  vib.stop(t + 0.20 * durMul);
+      
+          n.start(t);
+          n.stop(t + 0.13 * durMul);
+        }
       },
 
       // 2) Balloon plop (highpassed noise pop)
